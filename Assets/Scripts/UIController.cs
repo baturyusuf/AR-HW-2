@@ -53,7 +53,6 @@ public class UIController : MonoBehaviour
     // UI Buttons
     public void ToggleMethod()
     {
-        Debug.Log("Toggle Method Button Pressed");
         withScale = !withScale;
         UpdateParamsTextIdle();
     }

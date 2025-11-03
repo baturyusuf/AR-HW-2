@@ -32,26 +32,29 @@ public static class Registration
 
         for (int it = 0; it < iters; it++)
         {
-            // 1) Q’dan 3 rasgele indeks
+            // --- 1) Q’dan 3 indeks seç ve dejenere üçlüleri ele ---
             int a = rng.Next(Q.Length), b = rng.Next(Q.Length), c = rng.Next(Q.Length);
             if (a == b || b == c || a == c) { it--; continue; }
-
             var qA = Q[a]; var qB = Q[b]; var qC = Q[c];
+            if (IsDegenerateTriplet(qA, qB, qC)) { it--; continue; }
 
-            // 2) P’de en yakın komşular
+            // --- 2) P’de en yakın komşular ---
             var pA = Nearest(qA, P);
             var pB = Nearest(qB, P);
             var pC = Nearest(qC, P);
 
-            // 3) Hipotez çöz
             Vector3[] P3 = new[] { pA, pB, pC };
             Vector3[] Q3 = new[] { qA, qB, qC };
 
+            // --- 3) Hipotez ---
             (Matrix4x4 R, Vector3 T, float s) = withScale
-                ? Umeyama(P3, Q3)
-                : KabschNoScale(P3, Q3);
+                ? Umeyama(P3, Q3)          // s,R,T
+                : KabschNoScale(P3, Q3);   // R,T (s=1)
 
-            // 4) İnlier say
+            // mantıksız ölçekleri diskalifiye et (RANSAC içinde)
+            if (withScale && (s < 0.2f || s > 5f)) continue;
+
+            // --- 4) İnlier say ---
             int inl = 0;
             for (int i = 0; i < Q.Length; i++)
             {
@@ -67,6 +70,34 @@ public static class Registration
             }
         }
 
+        // --- 5) Refit: en iyi hipotezle inlier eşleşmeleri oluştur, kapalı form tekrar çöz ---
+        if (bestInliers > 0)
+        {
+            List<Vector3> Pin = new(); List<Vector3> Qin = new();
+            for (int i = 0; i < Q.Length; i++)
+            {
+                Vector3 qh = (Vector3)(bestR.MultiplyPoint3x4(Q[i] * bestS) + bestT);
+                Vector3 pnn = Nearest(qh, P);
+                if ((qh - pnn).magnitude < inlierThresh)
+                {
+                    // EŞLEŞME: Q[i] ↔ Pnn
+                    Qin.Add(Q[i]);
+                    Pin.Add(pnn);
+                }
+            }
+            if (Pin.Count >= 3)
+            {
+                (Matrix4x4 Rf, Vector3 Tf, float sf) = withScale
+                    ? Umeyama(Pin, Qin)
+                    : KabschNoScale(Pin, Qin);
+
+                // son bir kıskaç
+                if (withScale) sf = Mathf.Clamp(sf, 0.2f, 5f);
+
+                bestR = Rf; bestT = Tf; bestS = sf; bestInliers = Pin.Count;
+            }
+        }
+
         return new RigidResult { R = bestR, T = bestT, Scale = bestS, Inliers = bestInliers };
     }
 
@@ -76,32 +107,36 @@ public static class Registration
         return Umeyama(P, Q, forceUnitScale: true);
     }
 
-    // P ≈ s * R * Q + T   (Umeyama benzeri; SVD yok → polar decomposition yaklaşımı)
-    public static (Matrix4x4 R, Vector3 T, float s) Umeyama(IList<Vector3> P, IList<Vector3> Q, bool forceUnitScale = false)
+    // P ≈ s * R * Q + T  (SVD olmadan: R için polar approx, s için dot-product oranı)
+    public static (Matrix4x4 R, Vector3 T, float s) Umeyama(
+        IList<Vector3> P, IList<Vector3> Q,
+        bool forceUnitScale = false,
+        float sClampMin = 1e-3f, float sClampMax = 1e+3f)
     {
         if (P.Count != Q.Count) throw new Exception("Umeyama: P ve Q aynı sayıda nokta içermeli.");
 
         Centroids(P, out Vector3 cP);
         Centroids(Q, out Vector3 cQ);
 
-        Matrix4x4 Sigma = CrossCovariance(P, Q, cP, cQ); // 3x3 blok dolu
-        Matrix4x4 R = PolarDecomposition(Sigma);         // yaklaşık ortonormal
-
-        // 3×3 blok dışındaki (çeviri) elemanları sıfırla (güvenlik)
+        Matrix4x4 Sigma = CrossCovariance(P, Q, cP, cQ); // 3x3
+        Matrix4x4 R = PolarDecomposition(Sigma);
         ZeroTranslation(ref R);
-
-        // var(Q)
-        float varQ = 0f;
-        for (int i = 0; i < Q.Count; i++)
-            varQ += (Q[i] - cQ).sqrMagnitude;
-        varQ /= Mathf.Max(1, Q.Count);
 
         float s = 1f;
         if (!forceUnitScale)
         {
-            // s = trace(Sigma^T * R) / var(Q)
-            float trace = Trace(Transpose(Sigma) * R);
-            s = (varQ > 1e-8f) ? (trace / varQ) : 1f;
+            // s = sum_i <p_i', R q_i'> / sum_i ||q_i'||^2
+            float num = 0f, den = 0f;
+            for (int i = 0; i < Q.Count; i++)
+            {
+                Vector3 qp = P[i] - cP;
+                Vector3 qq = Q[i] - cQ;
+                Vector3 Rqq = (Vector3)R.MultiplyVector(qq);
+                num += Vector3.Dot(qp, Rqq);
+                den += qq.sqrMagnitude;
+            }
+            if (den > 1e-12f) s = num / den;
+            s = Mathf.Clamp(s, sClampMin, sClampMax);
         }
 
         Vector3 T = cP - (Vector3)(R.MultiplyPoint3x4(cQ * s));
@@ -111,6 +146,18 @@ public static class Registration
     // -----------------------------
     // PRIVATE HELPERS
     // -----------------------------
+    static bool IsDegenerateTriplet(Vector3 a, Vector3 b, Vector3 c)
+    {
+        // neredeyse aynı veya neredeyse koliner üçlüleri ele
+        if ((a - b).sqrMagnitude < 1e-6f) return true;
+        if ((a - c).sqrMagnitude < 1e-6f) return true;
+        if ((b - c).sqrMagnitude < 1e-6f) return true;
+        Vector3 u = (b - a).normalized;
+        Vector3 v = (c - a).normalized;
+        float s = Vector3.Cross(u, v).magnitude; // sin(theta)
+        return s < 0.05f; // ~<3°
+    }
+
     static Vector3 Nearest(Vector3 x, Vector3[] P)
     {
         float best = float.MaxValue; int bi = 0;
@@ -135,12 +182,11 @@ public static class Registration
         for (int i = 0; i < P.Count; i++)
         {
             Vector3 p = P[i] - cP; Vector3 q = Q[i] - cQ;
-            // H += p * q^T (3x3)
             H.m00 += p.x * q.x; H.m01 += p.x * q.y; H.m02 += p.x * q.z;
             H.m10 += p.y * q.x; H.m11 += p.y * q.y; H.m12 += p.y * q.z;
             H.m20 += p.z * q.x; H.m21 += p.z * q.y; H.m22 += p.z * q.z;
         }
-        H.m33 = 1f; // 3x3 blok dışını etkisiz bırak
+        H.m33 = 1f;
         return H;
     }
 
@@ -150,18 +196,32 @@ public static class Registration
         T.m00 = M.m00; T.m01 = M.m10; T.m02 = M.m20;
         T.m10 = M.m01; T.m11 = M.m11; T.m12 = M.m21;
         T.m20 = M.m02; T.m21 = M.m12; T.m22 = M.m22;
-        // m33 zaten 1
         return T;
     }
-
-    static float Trace(Matrix4x4 M) => M.m00 + M.m11 + M.m22;
 
     static void ZeroTranslation(ref Matrix4x4 M)
     {
         M.m03 = 0f; M.m13 = 0f; M.m23 = 0f;
     }
 
-    // ---- Matrix helpers (Unity Matrix4x4: skaler çarpma ve fark operatörleri yok) ----
+    // Newton–Schulz ≈ polar; ardından ortonormalizasyon + det>0 düzeltmesi
+    static Matrix4x4 PolarDecomposition(Matrix4x4 A)
+    {
+        Matrix4x4 X = A;
+        for (int i = 0; i < 8; i++)
+        {
+            Matrix4x4 Xt = Transpose(X);
+            Matrix4x4 XtX = Xt * X;
+            Matrix4x4 threeI = MatScale(Matrix4x4.identity, 3f);
+            Matrix4x4 term = MatSub(threeI, XtX);
+            X = MatScale(X * term, 0.5f);
+        }
+        Orthonormalize(ref X);
+        ZeroTranslation(ref X);
+        X.m33 = 1f;
+        return X;
+    }
+
     static Matrix4x4 MatScale(Matrix4x4 A, float s)
     {
         Matrix4x4 M = A;
@@ -182,25 +242,6 @@ public static class Registration
         return M;
     }
 
-    // Newton–Schulz ile yaklaşık polar ayrışım (R ≈ A (A^T A)^(-1/2))
-    static Matrix4x4 PolarDecomposition(Matrix4x4 A)
-    {
-        Matrix4x4 X = A;
-        for (int i = 0; i < 8; i++)
-        {
-            Matrix4x4 Xt = Transpose(X);
-            Matrix4x4 XtX = Xt * X;                           // matmul var
-            Matrix4x4 threeI = MatScale(Matrix4x4.identity, 3f);
-            Matrix4x4 term = MatSub(threeI, XtX);             // (3I - X^T X)
-            X = MatScale(X * term, 0.5f);                     // 0.5 * X * (3I - X^T X)
-        }
-        Orthonormalize(ref X);
-        ZeroTranslation(ref X);
-        X.m33 = 1f;
-        return X;
-    }
-
-    // Basit Gram-Schmidt ile 3×3 bloğu ortonormal yap
     static void Orthonormalize(ref Matrix4x4 M)
     {
         Vector3 c0 = new Vector3(M.m00, M.m10, M.m20);
@@ -209,6 +250,10 @@ public static class Registration
         c0 = c0.normalized;
         c1 = (c1 - Vector3.Dot(c1, c0) * c0).normalized;
         Vector3 c2 = Vector3.Cross(c0, c1);
+
+        // sağ ellilik
+        float det = Vector3.Dot(c0, Vector3.Cross(c1, c2));
+        if (det < 0f) c2 = -c2;
 
         M.m00 = c0.x; M.m10 = c0.y; M.m20 = c0.z;
         M.m01 = c1.x; M.m11 = c1.y; M.m21 = c1.z;
