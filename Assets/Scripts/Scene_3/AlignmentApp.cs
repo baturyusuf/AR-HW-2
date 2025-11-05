@@ -1,51 +1,76 @@
+using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using UnityEngine;
 using UnityEngine.UI;
+using UnityEngine.Networking;
 using TMPro;
 
 public class AlignmentApp : MonoBehaviour
 {
-    [Header("UI References")]
-    [SerializeField] private Button btnMethodToggle;     // Rigid <-> Similarity
-    [SerializeField] private Button btnVizToggle;        // Points <-> Motion
+    [SerializeField] private Button btnMethodToggle;   
+    [SerializeField] private Button btnVizToggle;      
     [SerializeField] private Button btnLoadP;
     [SerializeField] private Button btnLoadQ;
     [SerializeField] private Button btnAlign;
-    [SerializeField] private TMP_InputField inputPathP;  // veya UnityEngine.UI.InputField
+    [SerializeField] private TMP_InputField inputPathP;
     [SerializeField] private TMP_InputField inputPathQ;
-    [SerializeField] private TMP_Text statusText;        // çıktı yazısı
+    [SerializeField] private TMP_Text statusText;
 
-    [Header("Rendering")]
+    [SerializeField] private TMP_InputField inputMaxIters;     
+    [SerializeField] private TMP_InputField inputInlierThresh;  
+    [SerializeField] private TMP_InputField inputRandomSeed;    
+    [SerializeField] private TMP_InputField inputScaleFactor;  
+
     [SerializeField] private float pointSize = 0.03f;
     [SerializeField] private Material matP;
     [SerializeField] private Material matQ;
     [SerializeField] private Material matQAligned;
     [SerializeField] private Material matMotionLine;
 
-    [Header("RANSAC Params")]
     [SerializeField] private RegistrationMethod method = RegistrationMethod.Rigid;
     [SerializeField] private int maxIterations = 200;
     [SerializeField] private float inlierThreshold = 0.02f;
     [SerializeField] private int randomSeed = 1234;
 
-    // Data
     private Vector3[] P, Q;
     private AlignResult result;
     private bool viewMotion = false;
 
-    // Scene holders
     private Transform rootP, rootQ, rootQAligned, rootLines;
+    private float scaleFactor = 0.1f;
 
     private void Awake()
     {
-        // UI wiring
         if (btnMethodToggle) btnMethodToggle.onClick.AddListener(ToggleMethod);
         if (btnVizToggle)    btnVizToggle.onClick.AddListener(ToggleViz);
         if (btnLoadP)        btnLoadP.onClick.AddListener(LoadP);
         if (btnLoadQ)        btnLoadQ.onClick.AddListener(LoadQ);
         if (btnAlign)        btnAlign.onClick.AddListener(DoAlign);
 
-        // parents
+        if (inputMaxIters)
+        {
+            inputMaxIters.text = maxIterations.ToString(CultureInfo.InvariantCulture);
+            inputMaxIters.onEndEdit.AddListener(_ => ApplyUserParams());
+        }
+        if (inputInlierThresh)
+        {
+            inputInlierThresh.text = inlierThreshold.ToString(CultureInfo.InvariantCulture);
+            inputInlierThresh.onEndEdit.AddListener(_ => ApplyUserParams());
+        }
+        if (inputRandomSeed)
+        {
+            inputRandomSeed.text = randomSeed.ToString(CultureInfo.InvariantCulture);
+            inputRandomSeed.onEndEdit.AddListener(_ => ApplyUserParams());
+        }
+
+        if (inputScaleFactor)
+        {
+            inputScaleFactor.text = scaleFactor.ToString(CultureInfo.InvariantCulture);
+            inputScaleFactor.onEndEdit.AddListener(_ => ApplyScaleFactor());
+        }
+
         rootP = new GameObject("P_Points").transform;
         rootQ = new GameObject("Q_Points").transform;
         rootQAligned = new GameObject("Q_Aligned").transform;
@@ -56,6 +81,36 @@ public class AlignmentApp : MonoBehaviour
         Print("Ready. Load P and Q files.");
     }
 
+    private void ApplyUserParams()
+    {
+        if (inputMaxIters && !string.IsNullOrWhiteSpace(inputMaxIters.text))
+        {
+            if (int.TryParse(inputMaxIters.text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var iters))
+                maxIterations = Mathf.Max(1, iters);
+        }
+
+        if (inputInlierThresh && !string.IsNullOrWhiteSpace(inputInlierThresh.text))
+        {
+            if (float.TryParse(inputInlierThresh.text, NumberStyles.Float, CultureInfo.InvariantCulture, out var thr))
+                inlierThreshold = Mathf.Max(0f, thr);
+        }
+
+        if (inputRandomSeed && !string.IsNullOrWhiteSpace(inputRandomSeed.text))
+        {
+            if (int.TryParse(inputRandomSeed.text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var seed))
+                randomSeed = seed;
+        }
+    }
+
+    private void ApplyScaleFactor()
+    {
+        if (inputScaleFactor && !string.IsNullOrWhiteSpace(inputScaleFactor.text))
+        {
+            if (float.TryParse(inputScaleFactor.text, NumberStyles.Float, CultureInfo.InvariantCulture, out var factor))
+                scaleFactor = Mathf.Max(0f, factor);
+        }
+    }
+
     private void ClearChildren(Transform t)
     {
         for (int i = t.childCount - 1; i >= 0; i--)
@@ -64,34 +119,129 @@ public class AlignmentApp : MonoBehaviour
 
     private void LoadP()
     {
-        try
-        {
-            P = FilePointReader.LoadPointFile(inputPathP.text.Trim());
-            DrawPointCloud(P, rootP, matP);
-            Print($"Loaded P: {P.Length} points");
-        }
-        catch (System.SystemException e)
-        {
-            Print("Load P error: " + e.Message);
-        }
+        StartCoroutine(PrepareAndLoad(inputPathP ? inputPathP.text.Trim() : "", isP: true));
     }
 
     private void LoadQ()
     {
+        StartCoroutine(PrepareAndLoad(inputPathQ ? inputPathQ.text.Trim() : "", isP: false));
+    }
+
+    private IEnumerator PrepareAndLoad(string userInput, bool isP)
+    {
+        if (string.IsNullOrWhiteSpace(userInput))
+        {
+            Print("Path/Name is empty.");
+            yield break;
+        }
+
+        Print("Preparing file: " + userInput);
+
+        string realPath = null;
+
+        if (userInput.StartsWith("res:", System.StringComparison.OrdinalIgnoreCase))
+        {
+            string resName = userInput.Substring(4).Trim();
+            if (string.IsNullOrEmpty(resName))
+            {
+                Print("Invalid resources key.");
+                yield break;
+            }
+
+            TextAsset ta = Resources.Load<TextAsset>(resName);
+            if (ta == null)
+            {
+                Print($"Resources.Load failed: {resName}");
+                yield break;
+            }
+
+            realPath = Path.Combine(Application.persistentDataPath, resName + ".txt");
+            File.WriteAllText(realPath, ta.text);
+        }
+        else if (userInput.StartsWith("/") || userInput.StartsWith("file:", System.StringComparison.OrdinalIgnoreCase))
+        {
+            realPath = userInput.StartsWith("file:", System.StringComparison.OrdinalIgnoreCase)
+                ? new System.Uri(userInput).LocalPath
+                : userInput;
+
+            if (!File.Exists(realPath))
+            {
+                Print("File not found: " + realPath);
+                yield break;
+            }
+        }
+        else
+        {
+            string saPath = Path.Combine(Application.streamingAssetsPath, userInput);
+            string dstPath = Path.Combine(Application.persistentDataPath, userInput);
+
+            if (!File.Exists(dstPath))
+            {
+#if UNITY_ANDROID
+                using (var req = UnityWebRequest.Get(saPath))
+                {
+                    yield return req.SendWebRequest();
+                    if (req.result != UnityWebRequest.Result.Success)
+                    {
+                        Print("StreamingAssets read failed: " + req.error);
+                        yield break;
+                    }
+                    File.WriteAllBytes(dstPath, req.downloadHandler.data);
+                }
+#else
+                if (saPath.StartsWith("jar:") || saPath.StartsWith("file://"))
+                {
+                    using (var req = UnityWebRequest.Get(saPath))
+                    {
+                        yield return req.SendWebRequest();
+                        if (req.result != UnityWebRequest.Result.Success)
+                        {
+                            Print("StreamingAssets read failed: " + req.error);
+                            yield break;
+                        }
+                        File.WriteAllBytes(dstPath, req.downloadHandler.data);
+                    }
+                }
+                else
+                {
+                    if (!File.Exists(saPath))
+                    {
+                        Print("StreamingAssets file not found: " + saPath);
+                        yield break;
+                    }
+                    File.WriteAllBytes(dstPath, File.ReadAllBytes(saPath));
+                }
+#endif
+            }
+            realPath = dstPath;
+        }
+
         try
         {
-            Q = FilePointReader.LoadPointFile(inputPathQ.text.Trim());
-            DrawPointCloud(Q, rootQ, matQ);
-            Print($"Loaded Q: {Q.Length} points");
+            var pts = FilePointReader.LoadPointFile(realPath);
+            if (isP)
+            {
+                P = pts;
+                DrawPointCloud(P, rootP, matP);
+                Print($"Loaded P: {P.Length} points");
+            }
+            else
+            {
+                Q = pts;
+                DrawPointCloud(Q, rootQ, matQ);
+                Print($"Loaded Q: {Q.Length} points");
+            }
         }
         catch (System.SystemException e)
         {
-            Print("Load Q error: " + e.Message);
+            Print("Load error: " + e.Message);
         }
     }
 
     private void DoAlign()
     {
+        ApplyUserParams();
+
         if (P == null || Q == null)
         {
             Print("Please load P and Q first.");
@@ -105,16 +255,8 @@ public class AlignmentApp : MonoBehaviour
             return;
         }
 
-        // Görselleştirme
         Redraw();
-
-        // Sonuç yazdır
-        var Rm = result.R;
-        var Rrow0 = $"{Rm.m00:+0.000;-0.000} {Rm.m01:+0.000;-0.000} {Rm.m02:+0.000;-0.000}";
-        var Rrow1 = $"{Rm.m10:+0.000;-0.000} {Rm.m11:+0.000;-0.000} {Rm.m12:+0.000;-0.000}";
-        var Rrow2 = $"{Rm.m20:+0.000;-0.000} {Rm.m21:+0.000;-0.000} {Rm.m22:+0.000;-0.000}";
-        string scaleStr = (method == RegistrationMethod.Similarity) ? $"\ns = {result.s:0.000}" : "\ns = 1.000";
-        Print($"Inliers: {result.inlierCount}\nR =\n{Rrow0}\n{Rrow1}\n{Rrow2}\nT = ({result.T.x:+0.000;-0.000}, {result.T.y:+0.000;-0.000}, {result.T.z:+0.000;-0.000}){scaleStr}");
+        PrintResult();
     }
 
     private void Redraw()
@@ -122,7 +264,6 @@ public class AlignmentApp : MonoBehaviour
         ClearChildren(rootQAligned);
         ClearChildren(rootLines);
 
-        // her iki görselleştirme modu için önce hizalanmış Q noktalarını hesapla
         if (result.success)
         {
             var Qa = new Vector3[Q.Length];
@@ -131,20 +272,28 @@ public class AlignmentApp : MonoBehaviour
 
             if (!viewMotion)
             {
-                // Mod 1: Orijinal + hizalanmış noktalar (3 renk)
-                DrawPointCloud(P, rootP, matP);         // P: color A
-                DrawPointCloud(Q, rootQ, matQ);         // Q orijinal: color B
-                DrawPointCloud(Qa, rootQAligned, matQAligned); // Q aligned: color C
+                DrawPointCloud(P, rootP, matP);
+                DrawPointCloud(Q, rootQ, matQ);
+                DrawPointCloud(Qa, rootQAligned, matQAligned);
             }
             else
             {
-                // Mod 2: Sadece Q transform + hareket çizgisi
                 ClearChildren(rootP);
                 ClearChildren(rootQ);
                 DrawPointCloud(Qa, rootQAligned, matQAligned);
                 DrawMotionLines(Q, Qa, rootLines, matMotionLine);
             }
         }
+    }
+
+    private void PrintResult()
+    {
+        var Rm = result.R;
+        var Rrow0 = $"{Rm.m00:+0.000;-0.000} {Rm.m01:+0.000;-0.000} {Rm.m02:+0.000;-0.000}";
+        var Rrow1 = $"{Rm.m10:+0.000;-0.000} {Rm.m11:+0.000;-0.000} {Rm.m12:+0.000;-0.000}";
+        var Rrow2 = $"{Rm.m20:+0.000;-0.000} {Rm.m21:+0.000;-0.000} {Rm.m22:+0.000;-0.000}";
+        string scaleStr = (method == RegistrationMethod.Similarity) ? $"\ns = {result.s:0.000}" : "\ns = 1.000";
+        Print($"Inliers: {result.inlierCount}\nR =\n{Rrow0}\n{Rrow1}\n{Rrow2}\nT = ({result.T.x:+0.000;-0.000}, {result.T.y:+0.000;-0.000}, {result.T.z:+0.000;-0.000}){scaleStr}");
     }
 
     private void DrawPointCloud(Vector3[] pts, Transform parent, Material mat)
@@ -154,11 +303,10 @@ public class AlignmentApp : MonoBehaviour
         {
             var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
             go.transform.SetParent(parent, false);
-            go.transform.position = p;
+            go.transform.position = p * scaleFactor;
             go.transform.localScale = Vector3.one * pointSize;
             var r = go.GetComponent<Renderer>();
             if (mat != null) r.sharedMaterial = mat;
-            // Gereksiz collider'ı kaldır
             var col = go.GetComponent<Collider>();
             if (col) Destroy(col);
         }
@@ -175,8 +323,8 @@ public class AlignmentApp : MonoBehaviour
             var lr = go.AddComponent<LineRenderer>();
             lr.positionCount = 2;
             lr.useWorldSpace = true;
-            lr.SetPosition(0, qOrig[i]);
-            lr.SetPosition(1, qAligned[i]);
+            lr.SetPosition(0, qOrig[i] * scaleFactor);
+            lr.SetPosition(1, qAligned[i] * scaleFactor);
             lr.startWidth = lr.endWidth = Mathf.Max(0.5f * pointSize, 0.005f);
             if (mat) lr.sharedMaterial = mat;
             lr.numCapVertices = 4;
