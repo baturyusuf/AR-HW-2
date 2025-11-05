@@ -37,3 +37,9 @@ num_pts
 x1 x2 x3 ...
 y1 y2 y3 ...
 z1 z2 z3 ...
+
+
+
+
+https://github.com/user-attachments/assets/42a23eaa-3571-4989-8de2-650916efb8f8
+
